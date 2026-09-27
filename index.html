@@ -90,6 +90,7 @@ canvas{display:block;width:100%;height:100%;}
 <div class="hud bottombar" id="transport" style="display:none;">
   <div class="scrub" id="scrub"><div class="fill" id="scrubFill"></div><div class="knob" id="scrubKnob"></div></div>
   <div class="timerow"><span id="timeCur">0:00</span><span id="timeTotal">0:00</span></div>
+  <div style="font-size:10.5px;color:var(--muted);text-align:right;">Sampel piano: Salamander Grand Piano — Alexander Holm (CC BY 3.0)</div>
 </div>
 
 <script>
@@ -298,26 +299,76 @@ function buildNoteMeshes(notes){
   }
 }
 
-/* ---------------- Audio ---------------- */
+/* ---------------- Audio: real Salamander Grand Piano samples ---------------- */
+// Samples: "Salamander Grand Piano V3" by Alexander Holm, CC BY 3.0.
+// Sourced via the @audio-samples/piano-mp3-velocityN packages, served through
+// the jsdelivr npm CDN (an allowed script/asset host). Sampled every minor
+// third (A, C, D#, F#) — any note is at most 1 semitone from a real sample.
 let actx = null;
-const liveOsc = new Map();
-function freqOf(note){ return 440 * Math.pow(2, (note-69)/12); }
+const decodeCtx = new (window.AudioContext||window.webkitAudioContext)();
+const SAMPLE_LETTER = {0:'C',3:'D#',6:'F#',9:'A'};
+const LAYERS = [{tag:'3', vel:24},{tag:'12', vel:95}];
+const sampleBuffers = {};
+
+function sampleMidiFor(note){
+  const pc = note%12;
+  const off = pc%3===0?0:(pc%3===1?-1:1);
+  return note+off;
+}
+function sampleNameFor(sMidi){
+  return SAMPLE_LETTER[sMidi%12] + (Math.floor(sMidi/12)-1);
+}
+
+async function loadSamplesForNotes(notes){
+  const needed = new Set();
+  for(const n of notes) needed.add(sampleMidiFor(n.note));
+  const tasks = [];
+  for(const sMidi of needed){
+    const name = sampleNameFor(sMidi);
+    for(const layer of LAYERS){
+      const key = layer.tag+'|'+sMidi;
+      if(sampleBuffers[key]) continue;
+      const url = `https://cdn.jsdelivr.net/npm/@audio-samples/piano-mp3-velocity${layer.tag}/audio/${encodeURIComponent(name)}v${layer.tag}.mp3`;
+      tasks.push(fetch(url).then(r=>r.arrayBuffer())
+        .then(ab=>decodeCtx.decodeAudioData(ab))
+        .then(buf=>{ sampleBuffers[key]=buf; })
+        .catch(()=>{}));
+    }
+  }
+  await Promise.all(tasks);
+}
+
+function velocityWeights(vel){
+  const t = Math.min(1, Math.max(0, (vel-LAYERS[0].vel)/(LAYERS[1].vel-LAYERS[0].vel)));
+  const amp = 0.18 + 0.82*(vel/127);
+  return {[LAYERS[0].tag]: amp*(1-t), [LAYERS[1].tag]: amp*t};
+}
 
 function scheduleNote(note, when){
   if(!actx) return;
-  const osc = actx.createOscillator();
-  const gain = actx.createGain();
-  osc.type = 'triangle';
-  osc.frequency.value = freqOf(note.note);
-  const peak = 0.12 * (note.vel/127);
+  const sMidi = sampleMidiFor(note.note);
+  const rate = Math.pow(2, (note.note-sMidi)/12);
   const startAt = Math.max(actx.currentTime, when);
-  const endAt = startAt + Math.max(note.dur, 0.05);
-  gain.gain.setValueAtTime(0, startAt);
-  gain.gain.linearRampToValueAtTime(peak, startAt+0.015);
-  gain.gain.setTargetAtTime(0, endAt-0.03, 0.05);
-  osc.connect(gain).connect(actx.destination);
-  osc.start(startAt);
-  osc.stop(endAt+0.15);
+  const relDur = Math.max(note.dur, 0.12);
+  const weights = velocityWeights(note.vel);
+  const master = actx.createGain();
+  master.connect(actx.destination);
+  for(const layer of LAYERS){
+    const weight = weights[layer.tag];
+    const buf = sampleBuffers[layer.tag+'|'+sMidi];
+    if(!buf || weight < 0.003) continue;
+    const src = actx.createBufferSource();
+    src.buffer = buf; src.playbackRate.value = rate;
+    const g = actx.createGain();
+    g.gain.setValueAtTime(0, startAt);
+    g.gain.linearRampToValueAtTime(weight, startAt+0.005);
+    const relStart = startAt + relDur;
+    g.gain.setValueAtTime(weight, relStart);
+    g.gain.exponentialRampToValueAtTime(0.0004, relStart+0.4);
+    src.connect(g).connect(master);
+    src.start(startAt);
+    src.stop(relStart+0.45);
+  }
 }
 
 /* ---------------- Playback state ---------------- */
@@ -380,13 +431,16 @@ fileInput.addEventListener('change', async (e)=>{
     currentNotes = notes; totalDuration = duration;
     pausedAt = 0; isPlaying = false;
     buildNoteMeshes(notes);
-    document.getElementById('playBtn').disabled = false;
     document.getElementById('transport').style.display = 'flex';
     document.getElementById('timeTotal').textContent = fmtTime(duration);
+    document.getElementById('loadingState').textContent = 'Memuat sampel piano…';
+    await loadSamplesForNotes(notes);
+    document.getElementById('playBtn').disabled = false;
   }catch(err){
     document.getElementById('fileName').textContent = 'Gagal membaca: '+err.message;
   }
   document.getElementById('loadingState').style.display='none';
+  document.getElementById('loadingState').textContent = 'Membaca file MIDI…';
 });
 
 document.getElementById('playBtn').addEventListener('click', ()=>{
