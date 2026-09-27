@@ -348,7 +348,7 @@ function scheduleNote(note, when){
   if(!actx) return;
   const sMidi = sampleMidiFor(note.note);
   const rate = Math.pow(2, (note.note-sMidi)/12);
-  const startAt = Math.max(actx.currentTime, when);
+  const startAt = Math.max(actx.currentTime + 0.03, when);
   const relDur = Math.max(note.dur, 0.12);
   const weights = velocityWeights(note.vel);
   const master = actx.createGain();
@@ -374,8 +374,9 @@ function scheduleNote(note, when){
 /* ---------------- Playback state ---------------- */
 let currentNotes = [], totalDuration = 0;
 let isPlaying = false, playStartCtxTime = 0, pausedAt = 0;
-let startPtr = 0;
+let startPtr = 0, schedulePtr = 0;
 const activeSet = new Set();
+const SCHEDULE_AHEAD = 1.2; // seconds of lookahead scheduled per tick, not the whole song at once
 
 function fmtTime(s){
   s = Math.max(0,s);
@@ -386,7 +387,16 @@ function fmtTime(s){
 function resetPlaybackPointers(fromTime){
   startPtr = 0;
   while(startPtr < currentNotes.length && currentNotes[startPtr].start < fromTime) startPtr++;
+  schedulePtr = startPtr;
   activeSet.clear();
+}
+
+function schedulerTick(t){
+  const aheadUntil = t + SCHEDULE_AHEAD;
+  while(schedulePtr < currentNotes.length && currentNotes[schedulePtr].start <= aheadUntil){
+    scheduleNote(currentNotes[schedulePtr], playStartCtxTime + currentNotes[schedulePtr].start);
+    schedulePtr++;
+  }
 }
 
 function play(){
@@ -396,10 +406,12 @@ function play(){
   isPlaying = true;
   playStartCtxTime = actx.currentTime - pausedAt;
   resetPlaybackPointers(pausedAt);
-  for(const n of currentNotes){
-    if(n.start >= pausedAt) scheduleNote(n, playStartCtxTime + n.start);
-    else if(n.end > pausedAt) scheduleNote({...n, dur: n.end-pausedAt}, playStartCtxTime + pausedAt);
+  // re-trigger only the handful of notes already sounding at this exact point (e.g. resumed mid-note)
+  for(let i=0;i<startPtr;i++){
+    const n = currentNotes[i];
+    if(n.end > pausedAt) scheduleNote({...n, dur: n.end-pausedAt}, playStartCtxTime + pausedAt);
   }
+  schedulerTick(pausedAt); // schedule just the next ~1.2s, rest comes incrementally each frame
   document.getElementById('playBtn').textContent = '⏸ Pause';
 }
 function pause(){
@@ -482,6 +494,7 @@ function frame(){
   let t = pausedAt;
   if(isPlaying && actx){
     t = actx.currentTime - playStartCtxTime;
+    schedulerTick(t);
     if(t >= totalDuration + 0.5){ isPlaying=false; pausedAt=totalDuration; actx.close(); actx=null; document.getElementById('playBtn').textContent='▶ Play'; t=totalDuration; }
   }
 
