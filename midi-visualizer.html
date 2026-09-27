@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>MIDI Falling Visualizer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+:root{
+  --bg:#07070b; --bg2:#0d0d16; --ivory:#f2ede3; --ebony:#17151b;
+  --ink:#e9e6de; --muted:#8b8a94; --line:rgba(255,255,255,.09);
+  --accent:#8ee6c9;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);
+  font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  overflow:hidden;
+  padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);}
+#stage{position:fixed;inset:0;}
+canvas{display:block;width:100%;height:100%;}
+
+.hud{position:fixed;left:0;right:0;z-index:5;pointer-events:none;}
+.hud > *{pointer-events:auto;}
+
+.topbar{top:env(safe-area-inset-top,0px);padding:22px 26px;display:flex;align-items:flex-start;
+  justify-content:space-between;gap:16px;}
+.brand{display:flex;flex-direction:column;gap:2px;}
+.brand .name{font-size:15px;letter-spacing:.01em;font-weight:600;color:var(--ink);}
+.brand .file{font-size:12.5px;color:var(--muted);max-width:46vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+
+.controls{display:flex;align-items:center;gap:10px;}
+.btn{
+  background:rgba(255,255,255,.05); border:1px solid var(--line); color:var(--ink);
+  padding:10px 16px; border-radius:9px; font-size:13.5px; font-weight:500; cursor:pointer;
+  transition:background .15s ease, border-color .15s ease; backdrop-filter:blur(6px);
+  display:flex; align-items:center; gap:8px;
+}
+.btn:hover{background:rgba(255,255,255,.1); border-color:rgba(255,255,255,.18);}
+.btn:active{transform:translateY(1px);}
+.btn:disabled{opacity:.35; cursor:not-allowed;}
+.btn.primary{background:var(--accent); color:#08110d; border-color:var(--accent); font-weight:600;}
+.btn.primary:hover{background:#a5f0d7;}
+#fileInput{display:none;}
+
+.bottombar{bottom:env(safe-area-inset-bottom,0px);padding:0 26px 24px;display:flex;flex-direction:column;gap:10px;}
+.scrub{position:relative;height:4px;border-radius:2px;background:rgba(255,255,255,.1);cursor:pointer;}
+.scrub .fill{position:absolute;left:0;top:0;bottom:0;border-radius:2px;background:var(--accent);width:0%;}
+.scrub .knob{position:absolute;top:50%;width:11px;height:11px;border-radius:50%;background:var(--accent);
+  transform:translate(-50%,-50%);left:0%;box-shadow:0 0 0 4px rgba(142,230,201,.15);}
+.timerow{display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted);
+  font-variant-numeric:tabular-nums;}
+
+.empty{
+  position:absolute; left:50%; top:44%; transform:translate(-50%,-50%);
+  text-align:center; max-width:420px; z-index:4;
+}
+.empty h1{font-size:26px;font-weight:600;margin:0 0 8px;letter-spacing:-.01em;}
+.empty p{font-size:14px;color:var(--muted);line-height:1.55;margin:0 0 22px;}
+
+.loading{position:absolute;left:50%;top:44%;transform:translate(-50%,-50%);font-size:13px;color:var(--muted);z-index:4;}
+
+@media (max-width:640px){
+  .topbar{flex-direction:column;align-items:stretch;}
+  .brand .file{max-width:90vw;}
+  .controls{flex-wrap:wrap;}
+}
+</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<div class="hud topbar">
+  <div class="brand">
+    <div class="name">Falling — MIDI Visualizer</div>
+    <div class="file" id="fileName">Belum ada file dimuat</div>
+  </div>
+  <div class="controls">
+    <button class="btn primary" id="pickBtn">Pilih file MIDI</button>
+    <input type="file" id="fileInput" accept=".mid,.midi">
+    <button class="btn" id="playBtn" disabled>▶ Play</button>
+  </div>
+</div>
+
+<div class="empty" id="emptyState">
+  <h1>Jatuhkan not, mainkan musik</h1>
+  <p>Muat berkas .mid dan setiap not akan jatuh sebagai balok 3D tepat ke tuts yang sesuai, mengikuti waktu asli dari file tersebut.</p>
+</div>
+<div class="loading" id="loadingState" style="display:none;">Membaca file MIDI…</div>
+
+<div class="hud bottombar" id="transport" style="display:none;">
+  <div class="scrub" id="scrub"><div class="fill" id="scrubFill"></div><div class="knob" id="scrubKnob"></div></div>
+  <div class="timerow"><span id="timeCur">0:00</span><span id="timeTotal">0:00</span></div>
+</div>
+
+<script>
+/* ---------------- MIDI parsing ---------------- */
+function readVarLen(dv, pos){
+  let value = 0, b;
+  do{ b = dv.getUint8(pos++); value = (value<<7) | (b & 0x7f); } while(b & 0x80);
+  return [value, pos];
+}
+
+function parseMidi(buffer){
+  const dv = new DataView(buffer);
+  let pos = 0;
+  function str(n){ let s=''; for(let i=0;i<n;i++) s+=String.fromCharCode(dv.getUint8(pos+i)); pos+=n; return s; }
+  if(str(4) !== 'MThd') throw new Error('Bukan file MIDI yang valid');
+  const headerLen = dv.getUint32(pos); pos+=4;
+  const format = dv.getUint16(pos); pos+=2;
+  const numTracks = dv.getUint16(pos); pos+=2;
+  const division = dv.getUint16(pos); pos+=2;
+  pos += headerLen - 6;
+  const ppq = division & 0x8000 ? 480 : division;
+
+  const tracksEvents = [];
+  for(let t=0;t<numTracks;t++){
+    if(str(4) !== 'MTrk') throw new Error('Chunk track tidak valid');
+    const len = dv.getUint32(pos); pos+=4;
+    const end = pos+len;
+    let tick = 0, running = 0;
+    const events = [];
+    while(pos < end){
+      let delta; [delta,pos] = readVarLen(dv,pos);
+      tick += delta;
+      let status = dv.getUint8(pos);
+      if(status < 0x80){ status = running; } else { pos++; running = status; }
+      const type = status & 0xf0, ch = status & 0x0f;
+      if(status === 0xff){
+        const meta = dv.getUint8(pos); pos++;
+        let len2; [len2,pos] = readVarLen(dv,pos);
+        if(meta === 0x51){ // tempo
+          const mpqn = (dv.getUint8(pos)<<16)|(dv.getUint8(pos+1)<<8)|dv.getUint8(pos+2);
+          events.push({tick, tempo:mpqn});
+        }
+        pos += len2;
+      } else if(status === 0xf0 || status === 0xf7){
+        let len2; [len2,pos] = readVarLen(dv,pos); pos += len2;
+      } else if(type === 0xc0 || type === 0xd0){
+        pos += 1;
+      } else {
+        const d1 = dv.getUint8(pos), d2 = dv.getUint8(pos+1); pos += 2;
+        if(type === 0x90){ events.push({tick, on: d2>0, note:d1, vel:d2, ch}); }
+        else if(type === 0x80){ events.push({tick, on:false, note:d1, vel:0, ch}); }
+      }
+    }
+    pos = end;
+    tracksEvents.push(events);
+  }
+
+  // merge all events by tick, build tempo map
+  const all = [];
+  for(const evs of tracksEvents) for(const e of evs) all.push(e);
+  all.sort((a,b)=>a.tick-b.tick);
+
+  const tempoMap = [{tick:0, time:0, mpqn:500000}];
+  let lastTick=0, lastTime=0, lastMpqn=500000;
+  for(const e of all){
+    if(e.tempo !== undefined){
+      const dt = e.tick - lastTick;
+      lastTime += (dt/ppq) * (lastMpqn/1000000);
+      lastTick = e.tick; lastMpqn = e.tempo;
+      tempoMap.push({tick:lastTick, time:lastTime, mpqn:lastMpqn});
+    }
+  }
+  function tickToTime(tick){
+    let seg = tempoMap[0];
+    for(const s of tempoMap){ if(s.tick <= tick) seg = seg = s; else break; }
+    return seg.time + ((tick-seg.tick)/ppq) * (seg.mpqn/1000000);
+  }
+
+  const active = {}; // key "ch-note" -> {start, vel}
+  const notes = [];
+  for(const e of all){
+    if(e.tempo !== undefined) continue;
+    const key = e.ch+'-'+e.note;
+    if(e.on){
+      active[key] = {startTick:e.tick, vel:e.vel};
+    } else if(active[key]){
+      const a = active[key];
+      const start = tickToTime(a.startTick);
+      const endT = tickToTime(e.tick);
+      if(endT > start){
+        notes.push({note:e.note, start, end:endT, dur:endT-start, vel:a.vel, ch:e.ch});
+      }
+      delete active[key];
+    }
+  }
+  notes.sort((a,b)=>a.start-b.start);
+  const duration = notes.reduce((m,n)=>Math.max(m,n.end),0);
+  return {notes, duration};
+}
+
+/* ---------------- Keyboard geometry ---------------- */
+const PATTERN_X = [0,0.7,1,1.7,2,3,3.6,4,4.7,5,5.7,6];
+const IS_BLACK = [false,true,false,true,false,false,true,false,true,false,true,false];
+const WHITE_W = 1, WHITE_D = 5.4, WHITE_H = 0.35;
+const BLACK_W = 0.62, BLACK_D = 3.3, BLACK_H = 0.55;
+
+function keyGeometry(note){
+  const pc = note % 12;
+  const octave = Math.floor(note/12) - 1;
+  const x = octave*7*WHITE_W + PATTERN_X[pc];
+  return {x, black: IS_BLACK[pc]};
+}
+
+const KEY_INFO = {};
+let minX=Infinity, maxX=-Infinity;
+for(let n=21;n<=108;n++){
+  const g = keyGeometry(n);
+  KEY_INFO[n] = g;
+  const half = g.black ? BLACK_W/2 : WHITE_W/2;
+  minX = Math.min(minX, g.x-half); maxX = Math.max(maxX, g.x+half);
+}
+const KB_CENTER = (minX+maxX)/2;
+
+function noteColor(note){
+  const pc = note % 12;
+  const hue = (pc/12)*360;
+  return new THREE.Color(`hsl(${hue},72%,58%)`);
+}
+
+/* ---------------- Three.js scene ---------------- */
+const stage = document.getElementById('stage');
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x07070b, 0.011);
+const camera = new THREE.PerspectiveCamera(52, innerWidth/innerHeight, 0.1, 400);
+
+let camDist = 34, camYaw = 0, camPitch = 0.55;
+function updateCamera(){
+  const x = Math.sin(camYaw)*camDist*Math.cos(camPitch);
+  const z = Math.cos(camYaw)*camDist*Math.cos(camPitch) - camDist*0.15;
+  const y = 10 + camDist*Math.sin(camPitch);
+  camera.position.set(x, y, z + 14);
+  camera.lookAt(0, 2, -6);
+}
+updateCamera();
+
+const renderer = new THREE.WebGLRenderer({antialias:true, alpha:false});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputEncoding = THREE.sRGBEncoding;
+stage.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0x556080, 0.55));
+const key1 = new THREE.DirectionalLight(0xffffff, 0.9); key1.position.set(10,30,20); scene.add(key1);
+const rim = new THREE.PointLight(0x8ee6c9, 1.1, 60); rim.position.set(-14,10,-18); scene.add(rim);
+const rim2 = new THREE.PointLight(0xff8a6b, 0.7, 60); rim2.position.set(16,8,-14); scene.add(rim2);
+
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(200,200),
+  new THREE.MeshStandardMaterial({color:0x0a0a10, roughness:1, metalness:0})
+);
+floor.rotation.x = -Math.PI/2; floor.position.y = -0.05; scene.add(floor);
+
+// keyboard
+const kbGroup = new THREE.Group();
+const whiteMat = new THREE.MeshStandardMaterial({color:0xf2ede3, roughness:.5, metalness:.05});
+const blackMat = new THREE.MeshStandardMaterial({color:0x17151b, roughness:.4, metalness:.1});
+const whiteGeo = new THREE.BoxGeometry(WHITE_W*0.97, WHITE_H, WHITE_D);
+const blackGeo = new THREE.BoxGeometry(BLACK_W, BLACK_H, BLACK_D);
+const keyMeshes = {};
+for(let n=21;n<=108;n++){
+  const g = KEY_INFO[n];
+  const geo = g.black ? blackGeo : whiteGeo;
+  const mat = (g.black ? blackMat : whiteMat).clone();
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(g.x-KB_CENTER, g.black ? BLACK_H/2+0.001 : WHITE_H/2, g.black ? -WHITE_D/2+BLACK_D/2 : 0);
+  mesh.userData.baseY = mesh.position.y;
+  mesh.userData.baseEmissive = 0;
+  kbGroup.add(mesh);
+  keyMeshes[n] = mesh;
+}
+scene.add(kbGroup);
+
+// falling note bars
+const FALL_SPEED = 9; // world units per second
+const barGeo = new THREE.BoxGeometry(1,1,1);
+const noteGroup = new THREE.Group();
+scene.add(noteGroup);
+let noteMeshes = [];
+
+function buildNoteMeshes(notes){
+  for(const m of noteMeshes) noteGroup.remove(m);
+  noteMeshes = [];
+  for(const note of notes){
+    const g = KEY_INFO[note.note];
+    const w = (g.black ? BLACK_W : WHITE_W) * 0.82;
+    const color = noteColor(note.note);
+    const mat = new THREE.MeshStandardMaterial({color, emissive:color, emissiveIntensity:0.35, roughness:.35, metalness:.2});
+    const mesh = new THREE.Mesh(barGeo, mat);
+    const depth = Math.max(note.dur*FALL_SPEED, 0.35);
+    mesh.scale.set(w, 0.5 + (note.vel/127)*0.5, depth);
+    mesh.position.x = g.x - KB_CENTER;
+    mesh.userData.note = note;
+    mesh.userData.depth = depth;
+    noteGroup.add(mesh);
+    noteMeshes.push(mesh);
+  }
+}
+
+/* ---------------- Audio ---------------- */
+let actx = null;
+const liveOsc = new Map();
+function freqOf(note){ return 440 * Math.pow(2, (note-69)/12); }
+
+function scheduleNote(note, when){
+  if(!actx) return;
+  const osc = actx.createOscillator();
+  const gain = actx.createGain();
+  osc.type = 'triangle';
+  osc.frequency.value = freqOf(note.note);
+  const peak = 0.12 * (note.vel/127);
+  const startAt = Math.max(actx.currentTime, when);
+  const endAt = startAt + Math.max(note.dur, 0.05);
+  gain.gain.setValueAtTime(0, startAt);
+  gain.gain.linearRampToValueAtTime(peak, startAt+0.015);
+  gain.gain.setTargetAtTime(0, endAt-0.03, 0.05);
+  osc.connect(gain).connect(actx.destination);
+  osc.start(startAt);
+  osc.stop(endAt+0.15);
+}
+
+/* ---------------- Playback state ---------------- */
+let currentNotes = [], totalDuration = 0;
+let isPlaying = false, playStartCtxTime = 0, pausedAt = 0;
+let startPtr = 0;
+const activeSet = new Set();
+
+function fmtTime(s){
+  s = Math.max(0,s);
+  const m = Math.floor(s/60), sec = Math.floor(s%60);
+  return m+':'+String(sec).padStart(2,'0');
+}
+
+function resetPlaybackPointers(fromTime){
+  startPtr = 0;
+  while(startPtr < currentNotes.length && currentNotes[startPtr].start < fromTime) startPtr++;
+  activeSet.clear();
+}
+
+function play(){
+  if(!currentNotes.length) return;
+  actx = actx || new (window.AudioContext||window.webkitAudioContext)();
+  if(actx.state === 'suspended') actx.resume();
+  isPlaying = true;
+  playStartCtxTime = actx.currentTime - pausedAt;
+  resetPlaybackPointers(pausedAt);
+  for(const n of currentNotes){
+    if(n.start >= pausedAt) scheduleNote(n, playStartCtxTime + n.start);
+    else if(n.end > pausedAt) scheduleNote({...n, dur: n.end-pausedAt}, playStartCtxTime + pausedAt);
+  }
+  document.getElementById('playBtn').textContent = '⏸ Pause';
+}
+function pause(){
+  isPlaying = false;
+  pausedAt = actx.currentTime - playStartCtxTime;
+  actx.close(); actx = null;
+  document.getElementById('playBtn').textContent = '▶ Play';
+}
+function seekTo(t){
+  const wasPlaying = isPlaying;
+  if(isPlaying){ isPlaying=false; if(actx){ actx.close(); actx=null; } }
+  pausedAt = Math.min(Math.max(t,0), totalDuration);
+  resetPlaybackPointers(pausedAt);
+  if(wasPlaying) play();
+}
+
+/* ---------------- UI wiring ---------------- */
+const fileInput = document.getElementById('fileInput');
+document.getElementById('pickBtn').addEventListener('click', ()=>fileInput.click());
+fileInput.addEventListener('change', async (e)=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  document.getElementById('emptyState').style.display='none';
+  document.getElementById('loadingState').style.display='block';
+  document.getElementById('fileName').textContent = f.name;
+  const buf = await f.arrayBuffer();
+  try{
+    const {notes, duration} = parseMidi(buf);
+    currentNotes = notes; totalDuration = duration;
+    pausedAt = 0; isPlaying = false;
+    buildNoteMeshes(notes);
+    document.getElementById('playBtn').disabled = false;
+    document.getElementById('transport').style.display = 'flex';
+    document.getElementById('timeTotal').textContent = fmtTime(duration);
+  }catch(err){
+    document.getElementById('fileName').textContent = 'Gagal membaca: '+err.message;
+  }
+  document.getElementById('loadingState').style.display='none';
+});
+
+document.getElementById('playBtn').addEventListener('click', ()=>{
+  if(isPlaying) pause(); else play();
+});
+
+const scrub = document.getElementById('scrub');
+scrub.addEventListener('click', (e)=>{
+  if(!totalDuration) return;
+  const r = scrub.getBoundingClientRect();
+  const frac = (e.clientX-r.left)/r.width;
+  seekTo(frac*totalDuration);
+});
+
+// simple drag-orbit + wheel zoom
+let dragging=false, lastX=0, lastY=0;
+renderer.domElement.addEventListener('pointerdown', e=>{dragging=true; lastX=e.clientX; lastY=e.clientY;});
+window.addEventListener('pointerup', ()=>dragging=false);
+window.addEventListener('pointermove', e=>{
+  if(!dragging) return;
+  camYaw += (e.clientX-lastX)*0.004;
+  camPitch = Math.min(1.1, Math.max(0.18, camPitch + (e.clientY-lastY)*0.003));
+  lastX=e.clientX; lastY=e.clientY; updateCamera();
+});
+renderer.domElement.addEventListener('wheel', e=>{
+  camDist = Math.min(70, Math.max(16, camDist + e.deltaY*0.02));
+  updateCamera();
+}, {passive:true});
+
+window.addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+/* ---------------- Render loop ---------------- */
+function frame(){
+  requestAnimationFrame(frame);
+  let t = pausedAt;
+  if(isPlaying && actx){
+    t = actx.currentTime - playStartCtxTime;
+    if(t >= totalDuration + 0.5){ isPlaying=false; pausedAt=totalDuration; actx.close(); actx=null; document.getElementById('playBtn').textContent='▶ Play'; t=totalDuration; }
+  }
+
+  while(startPtr < currentNotes.length && currentNotes[startPtr].start <= t){
+    activeSet.add(currentNotes[startPtr]); startPtr++;
+  }
+  for(const n of Array.from(activeSet)) if(n.end < t) activeSet.delete(n);
+
+  for(const n of currentNotes){
+    const key = keyMeshes[n.note]; if(!key) continue;
+  }
+  for(const n of Object.keys(keyMeshes)){
+    const mesh = keyMeshes[n];
+    mesh.position.y = mesh.userData.baseY;
+    mesh.material.emissiveIntensity = 0;
+  }
+  for(const n of activeSet){
+    const mesh = keyMeshes[n.note]; if(!mesh) continue;
+    mesh.position.y = mesh.userData.baseY - (n.note in keyMeshes ? (KEY_INFO[n.note].black?0.06:0.05) : 0);
+    mesh.material.emissive = noteColor(n.note);
+    mesh.material.emissiveIntensity = 0.9;
+  }
+
+  for(const mesh of noteMeshes){
+    const n = mesh.userData.note;
+    const zFront = (n.start - t) * FALL_SPEED;
+    const zBack = zFront + mesh.userData.depth;
+    mesh.position.z = -6 - (zFront+zBack)/2;
+    mesh.visible = zBack > -2 && zFront < 60;
+  }
+
+  if(totalDuration){
+    const frac = Math.min(1, t/totalDuration)*100;
+    document.getElementById('scrubFill').style.width = frac+'%';
+    document.getElementById('scrubKnob').style.left = frac+'%';
+    document.getElementById('timeCur').textContent = fmtTime(t);
+  }
+
+  renderer.render(scene, camera);
+}
+frame();
+</script>
+</body>
+</html>
